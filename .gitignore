@@ -18,3 +18,14 @@ deliverables*/
 *.parquet
 *.jsonl.gz
 *.jsonl.zst
+# experiment outputs / heavy dirs
+artifacts/
+models/
+data/
+._tmp_star_probe/
+# miscellany
+__pycache__/
+*.ipynb_checkpoints
+*.log
+*.ckpt
+.DS_Store

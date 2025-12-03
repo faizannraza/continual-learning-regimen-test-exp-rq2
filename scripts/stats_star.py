@@ -22,7 +22,7 @@ def parse_run_name(run: str):
         tail = Path(run).name
         m = RUN_RE.match(tail)
     if not m:
-        return dict(dataset="UNK", stream="-1", seed="-1", regimen=run)
+        return dict(dataset="UNK", stream=-1, seed=-1, regimen=run)
     d = m.groupdict()
     d["stream"] = int(d["stream"])
     d["seed"]   = int(d["seed"])
@@ -34,12 +34,12 @@ def t_crit_95(n):
         return float("nan")
     if HAVE_SCIPY:
         return float(spstats.t.ppf(0.975, df=n-1))
-    # rough approx for small n if SciPy missing
+    # rough approx if SciPy missing
     lookup = {2:12.7,3:4.30,4:3.18,5:2.78,6:2.57,7:2.45,8:2.36,9:2.31,10:2.26,15:2.13,20:2.09,30:2.04}
     return lookup.get(n, 1.96)
 
 def paired_ttest(x, y):
-    # returns (t, p) where p falls back to normal approx if SciPy missing
+    # returns (t, p)
     x = np.asarray(x, dtype=float); y = np.asarray(y, dtype=float)
     d = x - y
     n = d.size
@@ -72,32 +72,39 @@ def non_dominated(points):
 def make_pareto(df, outdir, title_suffix="all"):
     outdir = Path(outdir); outdir.mkdir(parents=True, exist_ok=True)
     # last day per run
-    last = df.sort_values(["Run","day"]).groupby("Run").tail(1).copy()
+    last = df.sort_values(["Run","day"]).groupby("Run", as_index=False).tail(1).copy()
     # compute total training seconds per run
     cost = df.groupby("Run")["train_seconds"].sum().rename("total_train_seconds")
     last = last.merge(cost, on="Run", how="left")
 
-    # parse run name columns
+    # Ensure meta columns present exactly once (avoid duplicates)
     meta = last["Run"].apply(parse_run_name).apply(pd.Series)
-    last = pd.concat([last, meta], axis=1)
+    for c in ["dataset","stream","seed","regimen"]:
+        if c not in last.columns:
+            last[c] = meta[c]
+    last = last.loc[:, ~last.columns.duplicated()]
 
     # color map per regimen
-    regimens = sorted(last["regimen"].unique())
-    colors = {r:c for r,c in zip(regimens, plt.rcParams['axes.prop_cycle'].by_key()['color'])}
+    regimens = sorted(last["regimen"].astype(str).unique())
+    color_cycle = plt.rcParams['axes.prop_cycle'].by_key()['color']
+    colors = {r: color_cycle[i % len(color_cycle)] for i, r in enumerate(regimens)}
 
     # global pareto
     pts = [(row["FFI_EM"], row["Legacy_EM"], i) for i, row in last.iterrows()]
     frontier = non_dominated(pts)
 
     plt.figure(figsize=(6.2,5.2))
+    # remember first index per regimen for legend
+    first_idx = {r: last.index[last["regimen"] == r][0] for r in regimens if (last["regimen"] == r).any()}
     for i, row in last.iterrows():
         s = 15 + 85 * (row["total_train_seconds"] / (last["total_train_seconds"].max()+1e-9))
+        label = row["regimen"] if i == first_idx.get(row["regimen"], None) else ""
         plt.scatter(row["FFI_EM"], row["Legacy_EM"], s=s, alpha=0.7,
-                    label=row["regimen"] if i == last.index[last["regimen"]==row["regimen"]][0] else "",
-                    c=colors[row["regimen"]])
+                    label=label, c=colors[row["regimen"]])
     # draw frontier
     fpts = last.loc[list(frontier)][["FFI_EM","Legacy_EM"]].sort_values(["FFI_EM","Legacy_EM"])
-    plt.plot(fpts["FFI_EM"], fpts["Legacy_EM"], lw=2, linestyle="--", color="k", label="Pareto frontier")
+    if len(fpts) >= 2:
+        plt.plot(fpts["FFI_EM"], fpts["Legacy_EM"], lw=2, linestyle="--", color="k", label="Pareto frontier")
 
     plt.xlabel("FFI (EM) – Fresh Facts")
     plt.ylabel("Legacy (EM) – Retention")
@@ -118,11 +125,12 @@ def make_pareto(df, outdir, title_suffix="all"):
         pts = [(row["FFI_EM"], row["Legacy_EM"], i) for i, row in g.iterrows()]
         frontier = non_dominated(pts)
         plt.figure(figsize=(6.2,5.2))
+        first_idx_g = {r: g.index[g["regimen"] == r][0] for r in g["regimen"].unique() if (g["regimen"] == r).any()}
         for i, row in g.iterrows():
             s = 15 + 85 * (row["total_train_seconds"] / (g["total_train_seconds"].max()+1e-9))
+            label = row["regimen"] if i == first_idx_g.get(row["regimen"], None) else ""
             plt.scatter(row["FFI_EM"], row["Legacy_EM"], s=s, alpha=0.7,
-                        label=row["regimen"] if i == g.index[g["regimen"]==row["regimen"]][0] else "",
-                        c=colors[row["regimen"]])
+                        label=label, c=colors[row["regimen"]])
         fpts = g.loc[list(frontier)][["FFI_EM","Legacy_EM"]].sort_values(["FFI_EM","Legacy_EM"])
         if len(fpts) >= 2:
             plt.plot(fpts["FFI_EM"], fpts["Legacy_EM"], lw=2, linestyle="--", color="k", label="Pareto frontier")
@@ -148,22 +156,23 @@ def main():
     out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
     df = pd.read_csv(args.concat_csv)
 
-    # Harmonize legacy column names if needed
-    if "FFI" in df.columns and "LegacyAcc" in df.columns:
+    # Harmonize column names if needed
+    if "FFI_EM" not in df.columns and "FFI" in df.columns:
         df["FFI_EM"] = df["FFI"]
-        df["Legacy_EM"] = df["LegacyAcc"]
+    if "Legacy_EM" not in df.columns and "Legacy" in df.columns:
+        df["Legacy_EM"] = df["Legacy"]
 
-    # parse run metadata from folder names
-    meta = df["Run"].apply(parse_run_name).apply(pd.Series)
+    # parse run metadata from folder names (once)
+    meta = df["Run"].apply(parse_run_name).apply(pd.Series)  # dataset, stream, seed, regimen
     df = pd.concat([df, meta], axis=1)
+    df = df.loc[:, ~df.columns.duplicated()]   # <-- prevent duplicate columns later
 
     # ============ 95% CIs per day/regimen/dataset ============
     group_cols = ["dataset", "regimen", "day"]
     agg_rows = []
     for (dset, reg, day), g in df.groupby(group_cols):
         n = g["FFI_EM"].count()
-        for metric in ["FFI_EM", "Legacy_EM", "FFI_F1" if "FFI_F1" in df.columns else None]:
-            if metric is None: continue
+        for metric in ["FFI_EM", "Legacy_EM"] + (["FFI_F1"] if "FFI_F1" in df.columns else []):
             m = g[metric].mean()
             s = g[metric].std(ddof=1)
             tcrit = t_crit_95(n)
@@ -178,10 +187,14 @@ def main():
     wide = df.pivot_table(index=key_cols, columns="regimen", values=["FFI_EM","Legacy_EM"], aggfunc="mean")
     # Only keep rows where STAR and the baseline both exist
     paired_rows = []
-    baselines = [c for c in wide["FFI_EM"].columns if c.lower() != "star"]
+    reg_cols = [c for c in wide["FFI_EM"].columns if isinstance(c, str)]
+    baselines = [c for c in reg_cols if c.lower() != "star"]
     for b in baselines:
         # dropna on both STAR and baseline
-        w = wide.dropna(subset=[("FFI_EM","star"), ("FFI_EM",b), ("Legacy_EM","star"), ("Legacy_EM",b)], how="any")
+        if ("star" not in wide["FFI_EM"].columns) or (b not in wide["FFI_EM"].columns):
+            continue
+        needed = [("FFI_EM","star"), ("FFI_EM",b), ("Legacy_EM","star"), ("Legacy_EM",b)]
+        w = wide.dropna(subset=needed, how="any")
         if w.empty: continue
         ffi_star = w[("FFI_EM","star")].values
         ffi_base = w[("FFI_EM", b)].values

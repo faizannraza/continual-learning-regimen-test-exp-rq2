@@ -3,6 +3,7 @@ import os, sys, orjson, argparse, random, time, subprocess, math
 from pathlib import Path
 from glob import glob
 import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
 
 from star_router import STARRouter
 from utils_metrics import exact_match
@@ -13,9 +14,46 @@ def load_jsonl(path):
         for line in f: rows.append(orjson.loads(line))
     return rows
 
-def save_jsonl(path, rows):
+def save_jsonl(path: Path, rows):
+    """
+    Write rows to JSONL. Robust to NumPy scalars/arrays in rows.
+    Tries orjson's OPT_SERIALIZE_NUMPY; falls back to a sanitizer.
+    """
+    import numpy as np
+
+    def _jsonable(o):
+        # Recursively convert NumPy types to native Python
+        if isinstance(o, dict):
+            return {k: _jsonable(v) for k, v in o.items()}
+        if isinstance(o, list):
+            return [_jsonable(v) for v in o]
+        if isinstance(o, tuple):
+            return tuple(_jsonable(v) for v in o)
+        if isinstance(o, (np.floating, np.float32, np.float64)):
+            return float(o)
+        if isinstance(o, (np.integer, np.int32, np.int64)):
+            return int(o)
+        if isinstance(o, (np.bool_,)):
+            return bool(o)
+        if isinstance(o, np.ndarray):
+            return o.tolist()
+        # Scalars with .item()
+        if hasattr(o, "item") and callable(getattr(o, "item")):
+            try:
+                return o.item()
+            except Exception:
+                pass
+        return o
+
+    path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "wb") as f:
-        for r in rows: f.write(orjson.dumps(r)); f.write(b"\n")
+        for r in rows:
+            try:
+                f.write(orjson.dumps(r, option=orjson.OPT_SERIALIZE_NUMPY))
+            except Exception:
+                f.write(orjson.dumps(_jsonable(r)))
+            f.write(b"\n")
+
 
 def run_cmd(cmd):
     cmd = [str(x) for x in cmd]
@@ -40,30 +78,119 @@ def hardness_flags(base_model, adapter_dir, rows, device, fp16, max_new_tokens):
     # fallback: uniform hardness (0.5) to avoid heavy plumbing
     return [1.0]*len(preds)  # safe, conservative
 
-def far_weights(rows, today_rows, hardness, day_now, lam_h=1.0, lam_n=0.5, lam_t=0.2, gamma=0.1):
-    """Compute weights per item for FAR. Novelty = TF-IDF cosine to today's centroid (approx)."""
-    # very light TF-IDF novelty
+def far_weights(prev, today_rows, hardness, day_now,
+                lam_h=1.0, lam_n=0.5, lam_t=0.2,
+                far_gamma=0.1, gamma=None):
+    """
+    Compute FAR replay weights over 'prev' examples using three signals:
+      - hardness (model difficulty)
+      - novelty (TF-IDF distance from today's text)
+      - recency (time decay by day index)
+
+    Backwards-compat: accepts either 'far_gamma' or 'gamma'. If both are
+    provided, 'gamma' takes precedence.
+    """
+    if gamma is not None:
+        far_gamma = float(gamma)
+
+    import numpy as np
     from sklearn.feature_extraction.text import TfidfVectorizer
-    texts_today = [r["question"] for r in today_rows]
-    texts_all = [r["question"] for r in rows]
-    vec = TfidfVectorizer(max_features=4000)
-    V_today = vec.fit_transform(texts_today)
-    centroid = V_today.mean(axis=0)
-    V_all = vec.transform(texts_all)
-    # cosine distance to centroid
-    num = (V_all @ centroid.T).A.ravel()
-    denom = (np.linalg.norm(V_all.A, axis=1) * np.linalg.norm(centroid.A))
-    sim = np.divide(num, np.maximum(denom, 1e-8))
-    novelty = 1.0 - np.clip(sim, 0.0, 1.0)
 
-    # recency
-    ages = np.array([max(0, day_now - r.get("day_seen", day_now)) for r in rows], dtype=np.float32)
-    recency = np.exp(-gamma * ages)
+    n_prev = len(prev)
+    if n_prev == 0:
+        return np.array([], dtype=float)
 
-    hardness = np.array(hardness, dtype=np.float32)
-    w = lam_h*hardness + lam_n*novelty + lam_t*recency
-    w = np.maximum(w, 1e-6)
-    return w
+    # Helpers ---------------------------------------------------------------
+    def _row_text(r):
+        t = (r.get("text") or "").strip()
+        if not t:
+            q = (r.get("question") or "").strip()
+            a = (r.get("answer") or "").strip()
+            t = (q + " " + a).strip()
+        return t
+
+    def _hardness_vector():
+        if isinstance(hardness, (list, np.ndarray)) and len(hardness) == n_prev:
+            return np.asarray(hardness, dtype=float)
+        if isinstance(hardness, dict):
+            return np.asarray([hardness.get(i, 1.0) for i in range(n_prev)], dtype=float)
+        try:
+            h = float(hardness)
+            return np.full(n_prev, h, dtype=float)
+        except Exception:
+            return np.ones(n_prev, dtype=float)
+
+    def _recency_vector():
+        days = []
+        for r in prev:
+            d_i = r.get("day")
+            if isinstance(d_i, int):
+                delta = max(0, day_now - d_i)
+            else:
+                delta = 0
+            days.append(np.exp(-far_gamma * delta))
+        return np.asarray(days, dtype=float)
+
+    # Build text views ------------------------------------------------------
+    texts_prev_all = [_row_text(r) for r in prev]
+    keep_idx = [i for i, t in enumerate(texts_prev_all) if t]
+    if not keep_idx:
+        H = _hardness_vector()
+        T = _recency_vector()
+        w = lam_h * H + lam_t * T
+        w = np.maximum(w, 1e-8)
+        return w / w.sum()
+
+    texts_prev = [texts_prev_all[i] for i in keep_idx]
+    map_back = keep_idx
+
+    texts_today = []
+    for r in today_rows:
+        t = _row_text(r)
+        if t:
+            texts_today.append(t)
+
+    H_full = _hardness_vector()
+    T_full = _recency_vector()
+
+    # If no today text, skip novelty safely --------------------------------
+    if len(texts_today) == 0:
+        w = lam_h * H_full + lam_t * T_full
+        w = np.maximum(w, 1e-8)
+        return w / w.sum()
+
+    # Novelty via TF-IDF: use dense centroid to avoid sparse .matrix traps --
+    vec = TfidfVectorizer(max_features=8000, ngram_range=(1, 2))
+    vec.fit(texts_prev + texts_today)
+    V_prev = vec.transform(texts_prev)   # sparse CSR [n_prev_text, d]
+    V_today = vec.transform(texts_today) # sparse CSR [n_today_text, d]
+
+    # Dense centroid of today
+    c_today = np.asarray(V_today.mean(axis=0)).ravel()        # (d,)
+    c_norm = np.linalg.norm(c_today)
+    prev_norms = np.sqrt(V_prev.multiply(V_prev).sum(axis=1)).A.ravel()  # (n_prev_text,)
+
+    if c_norm == 0 or np.all(prev_norms == 0):
+        w = lam_h * H_full + lam_t * T_full
+        w = np.maximum(w, 1e-8)
+        return w / w.sum()
+
+    # Cosine similarity: sparse @ dense -> dense
+    numer = V_prev.dot(c_today)                                # (n_prev_text,)
+    sims = numer / (prev_norms * c_norm + 1e-12)
+    sims = np.clip(sims, 0.0, 1.0)
+    novelty_small = 1.0 - sims
+
+    # Scatter novelty back to full buffer size
+    N_full = np.zeros(n_prev, dtype=float)
+    for j, k in enumerate(map_back):
+        N_full[k] = novelty_small[j]
+
+    # Combine signals
+    w = lam_h * H_full + lam_n * N_full + lam_t * T_full
+    w = np.maximum(w, 1e-8)
+    return w / w.sum()
+
 
 def weighted_reservoir_add(buffer_rows, new_rows, weights, cap, day_now):
     """Efraimidis-Spirakis weighted reservoir sampling."""
@@ -189,17 +316,22 @@ def main(args):
         # === Evaluate FFI and Legacy using router (after training it) ===
         # First build router training set by probing a small adapter pool
         pool_names = pick_adapter_pool(args.adapters_root, regimen_folder, d, pool=args.pool_size)
+
+        # Effective k for today = min(requested, available adapters)
+        nA = len(pool_names)
+        k_eff = max(1, min(args.top_k, nA))
+
         # router labels from day eval + legacy sample
         legacy_all = load_jsonl(args.legacy_eval)
         legacy_rows = legacy_all[:min(len(legacy_all), args.legacy_probe_cap)]
-        eval_rows = load_jsonl(day_eval)[:min(args.max_eval, 500)]
+        eval_rows = load_jsonl(day_eval)[:min(args.max_eval, args.today_probe_cap)]
         router_rows = eval_rows + legacy_rows
         soft_targets = probe_soft_targets(args.base_model, args.adapters_root, pool_names,
                                           router_rows, args.device, args.fp16, args.max_new_tokens,
                                           beta=args.beta_forget)
 
-        # Train router
-        router = STARRouter(k=args.top_k, encoder=args.encoder, device=args.device)
+        # Train router (with k_eff)
+        router = STARRouter(k=k_eff, encoder=args.encoder, device=args.device)
         router.fit([r["question"] for r in router_rows], soft_targets, pool_names,
                    epochs=args.router_epochs, lr=args.router_lr, batch=128)
         router_dir = Path(args.out_root)/"routers"/day_tag; router.save(router_dir)
@@ -210,7 +342,7 @@ def main(args):
                  "--base_model", args.base_model, "--router_dir", str(router_dir),
                  "--adapter_bank_root", args.adapters_root,
                  "--qa_file", day_eval, "--out_dir", str(ffi_dir),
-                 "--top_k", str(args.top_k), "--max_eval", str(args.max_eval),
+                 "--top_k", str(k_eff), "--max_eval", str(args.max_eval),
                  "--max_new_tokens", str(args.max_new_tokens)])
 
         # Eval legacy with router
@@ -219,7 +351,7 @@ def main(args):
                  "--base_model", args.base_model, "--router_dir", str(router_dir),
                  "--adapter_bank_root", args.adapters_root,
                  "--qa_file", args.legacy_eval, "--out_dir", str(legacy_dir),
-                 "--top_k", str(args.top_k), "--max_eval", str(args.max_eval),
+                 "--top_k", str(k_eff), "--max_eval", str(args.max_eval),
                  "--max_new_tokens", str(args.max_new_tokens)])
 
         # Load metrics
@@ -268,6 +400,12 @@ if __name__ == "__main__":
     ap.add_argument("--router_epochs", type=int, default=8)
     ap.add_argument("--router_lr", type=float, default=1e-3)
     ap.add_argument("--beta_forget", type=float, default=0.5)
+
+    # probe caps
+    ap.add_argument("--today_probe_cap", type=int, default=512,
+                    help="Max examples from today's eval for router training.")
+    ap.add_argument("--legacy_probe_cap", type=int, default=512,
+                    help="Max examples from legacy holdout for router training.")
 
     # compute
     ap.add_argument("--device", default="")
